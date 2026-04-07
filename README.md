@@ -203,3 +203,156 @@ def create_product():
 - **Never leak internal errors to clients.** Log them server-side and return a generic message externally.
  
 ---
+
+## Part 2: Database Design
+ 
+### Schema (SQL DDL)
+ 
+```sql
+-- ================================================================
+-- StockFlow DATABASE SCHEMA
+-- ================================================================
+ 
+-- Core tenant / company entity
+CREATE TABLE companies (
+    id              SERIAL PRIMARY KEY,
+    name            VARCHAR(255) NOT NULL,
+    slug            VARCHAR(100) UNIQUE NOT NULL,
+    plan            VARCHAR(50)  NOT NULL DEFAULT 'starter',
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+ 
+-- Warehouses belong to a company
+CREATE TABLE warehouses (
+    id              SERIAL PRIMARY KEY,
+    company_id      INT          NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    name            VARCHAR(255) NOT NULL,
+    location        TEXT,
+    is_active       BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_warehouses_company ON warehouses(company_id);
+ 
+-- Products (warehouse-agnostic)
+CREATE TABLE products (
+    id              SERIAL PRIMARY KEY,
+    company_id      INT          NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    name            VARCHAR(255) NOT NULL,
+    sku             VARCHAR(100) NOT NULL,
+    description     TEXT,
+    price           NUMERIC(12,4) NOT NULL CHECK (price >= 0),
+    product_type    VARCHAR(50)  NOT NULL DEFAULT 'standard',  -- standard | bundle | raw_material
+    low_stock_threshold INT      NOT NULL DEFAULT 10,
+    is_active       BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    UNIQUE(company_id, sku)          -- SKU unique per company
+);
+CREATE INDEX idx_products_company ON products(company_id);
+CREATE INDEX idx_products_sku     ON products(company_id, sku);
+ 
+-- Bundle composition (which products make up a bundle)
+CREATE TABLE bundle_components (
+    id              SERIAL PRIMARY KEY,
+    bundle_id       INT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    component_id    INT NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+    quantity        INT NOT NULL CHECK (quantity > 0),
+    UNIQUE(bundle_id, component_id),
+    CHECK (bundle_id <> component_id)  -- a bundle cannot contain itself
+);
+ 
+-- Inventory: stock level per product per warehouse
+CREATE TABLE inventory (
+    id              SERIAL PRIMARY KEY,
+    product_id      INT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    warehouse_id    INT NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE,
+    quantity        INT NOT NULL DEFAULT 0 CHECK (quantity >= 0),
+    reserved_qty    INT NOT NULL DEFAULT 0 CHECK (reserved_qty >= 0),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(product_id, warehouse_id)
+);
+CREATE INDEX idx_inventory_product   ON inventory(product_id);
+CREATE INDEX idx_inventory_warehouse ON inventory(warehouse_id);
+ 
+-- Full audit trail of every stock change
+CREATE TABLE inventory_logs (
+    id              BIGSERIAL PRIMARY KEY,
+    inventory_id    INT NOT NULL REFERENCES inventory(id),
+    change_type     VARCHAR(50) NOT NULL,  -- sale | purchase | adjustment | transfer | return
+    quantity_delta  INT NOT NULL,          -- positive = stock in, negative = stock out
+    quantity_before INT NOT NULL,
+    quantity_after  INT NOT NULL,
+    reference_id    INT,                  -- order_id, purchase_order_id, etc.
+    reference_type  VARCHAR(50),
+    notes           TEXT,
+    created_by      INT REFERENCES users(id),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_inv_logs_inventory ON inventory_logs(inventory_id);
+CREATE INDEX idx_inv_logs_created   ON inventory_logs(created_at);
+ 
+-- Suppliers
+CREATE TABLE suppliers (
+    id              SERIAL PRIMARY KEY,
+    company_id      INT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    name            VARCHAR(255) NOT NULL,
+    contact_email   VARCHAR(255),
+    contact_phone   VARCHAR(50),
+    address         TEXT,
+    lead_time_days  INT,           -- avg days from order to delivery
+    is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+ 
+-- Which supplier provides which product (many-to-many, one marked primary)
+CREATE TABLE product_suppliers (
+    id              SERIAL PRIMARY KEY,
+    product_id      INT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    supplier_id     INT NOT NULL REFERENCES suppliers(id) ON DELETE CASCADE,
+    supplier_sku    VARCHAR(100),
+    unit_cost       NUMERIC(12,4),
+    is_primary      BOOLEAN NOT NULL DEFAULT FALSE,
+    UNIQUE(product_id, supplier_id)
+);
+ 
+-- Users
+CREATE TABLE users (
+    id              SERIAL PRIMARY KEY,
+    company_id      INT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    email           VARCHAR(255) UNIQUE NOT NULL,
+    role            VARCHAR(50)  NOT NULL DEFAULT 'member',
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+```
+ 
+---
+ 
+### Design Decisions
+ 
+| Decision | Reasoning |
+|----------|-----------|
+| `UNIQUE(company_id, sku)` on `products` | SKUs are unique per tenant, not globally. Two companies may use the same SKU string. |
+| `inventory` as a junction table | Cleanly models the many-to-many between products and warehouses. Separates catalogue data from logistics. |
+| Immutable `inventory_logs` | Append-only audit trail enables velocity calculations, compliance, and full history without data loss. |
+| `bundle_components` self-reference | Self-referencing FK on `products` models bundles without a separate table. `CHECK (bundle_id <> component_id)` prevents self-referencing loops. |
+| `NUMERIC(12,4)` for price/cost | Avoids floating-point rounding errors in financial calculations. |
+| `reserved_qty` on `inventory` | Distinguishes available stock from stock held for in-progress orders. Available = `quantity - reserved_qty`. |
+| Indexes on FK columns + `created_at` | Every FK used in joins gets an index. `inventory_logs.created_at` is always filtered in velocity queries. |
+ 
+---
+ 
+### Gaps & Questions for the Product Team
+ 
+1. **SKU uniqueness scope** — Global across the platform, or per company? *(Assumed: per company)*
+2. **Bundle stock tracking** — Is bundle stock tracked independently, or derived from component availability?
+3. **Threshold granularity** — Can `low_stock_threshold` vary per warehouse, or is it global per product?
+4. **Multiple suppliers** — How is the reorder supplier chosen when a product has several? *(Assumed: `is_primary` flag)*
+5. **Purchase orders** — Should the schema track supplier POs and expected delivery dates?
+6. **User roles** — What permissions do different roles have? Warehouse-level access control needed?
+7. **Inter-warehouse transfers** — Is this a first-class operation requiring a `transfers` table, or just two `inventory_log` rows?
+8. **Multi-currency** — Are all prices in a single currency, or does the platform need currency fields?
+9. **Soft delete vs. hard delete** — Can products/warehouses be deleted, or only deactivated?
+10. **Returns workflow** — Are returned goods immediately restocked, or do they go through inspection first?
+ 
+---
