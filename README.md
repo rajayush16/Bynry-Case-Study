@@ -356,3 +356,169 @@ CREATE TABLE users (
 10. **Returns workflow** — Are returned goods immediately restocked, or do they go through inspection first?
  
 ---
+
+## Part 3: API Implementation
+ 
+### Assumptions
+ 
+| Assumption | Value / Decision |
+|------------|-----------------|
+| "Recent sales activity" | At least 1 sale event in the last 30 days |
+| `days_until_stockout` formula | `current_stock ÷ avg daily velocity (30-day window)` |
+| `low_stock_threshold` | Stored per-product; does not vary by warehouse |
+| Bundle products | Excluded from alerts to avoid double-counting |
+| Supplier selection | Primary supplier only (`is_primary = TRUE`) |
+ 
+---
+ 
+### Implementation
+ 
+```python
+from flask import Flask, jsonify, abort
+from sqlalchemy import text
+from datetime import datetime, timedelta
+import logging
+ 
+app = Flask(__name__)
+logger = logging.getLogger(__name__)
+ 
+RECENT_SALES_DAYS = 30
+MIN_SALES_FOR_ALERT = 1
+ 
+ 
+@app.route('/api/companies/<int:company_id>/alerts/low-stock', methods=['GET'])
+def get_low_stock_alerts(company_id):
+    """
+    Returns low-stock alerts for all warehouses of a company.
+    Only includes products with recent sales activity.
+    Ordered by urgency (days_until_stockout ascending).
+    """
+    # --- 1. Validate company exists ---
+    company = Company.query.get(company_id)
+    if not company:
+        abort(404, description=f"Company {company_id} not found")
+ 
+    recent_cutoff = datetime.utcnow() - timedelta(days=RECENT_SALES_DAYS)
+ 
+    # --- 2. Single optimised query with CTE ---
+    # Pre-aggregate daily sales velocity per product/warehouse,
+    # then join against inventory to find rows below threshold.
+    query = text("""
+        WITH recent_sales AS (
+            SELECT
+                il.inventory_id,
+                COUNT(*)                                          AS sale_count,
+                COALESCE(SUM(ABS(il.quantity_delta))::float / :days, 0)
+                                                                  AS daily_velocity
+            FROM inventory_logs il
+            WHERE il.change_type = 'sale'
+              AND il.created_at  >= :cutoff
+            GROUP BY il.inventory_id
+        )
+        SELECT
+            p.id                    AS product_id,
+            p.name                  AS product_name,
+            p.sku,
+            p.low_stock_threshold   AS threshold,
+            w.id                    AS warehouse_id,
+            w.name                  AS warehouse_name,
+            inv.quantity            AS current_stock,
+            rs.daily_velocity,
+            rs.sale_count,
+            s.id                    AS supplier_id,
+            s.name                  AS supplier_name,
+            s.contact_email         AS supplier_email
+        FROM inventory         inv
+        JOIN products          p   ON p.id  = inv.product_id
+        JOIN warehouses        w   ON w.id  = inv.warehouse_id
+        JOIN recent_sales      rs  ON rs.inventory_id = inv.id
+        LEFT JOIN product_suppliers ps
+            ON ps.product_id = p.id AND ps.is_primary = TRUE
+        LEFT JOIN suppliers    s   ON s.id = ps.supplier_id
+        WHERE w.company_id          = :company_id
+          AND p.is_active           = TRUE
+          AND w.is_active           = TRUE
+          AND p.product_type       != 'bundle'
+          AND inv.quantity          < p.low_stock_threshold
+          AND rs.sale_count        >= :min_sales
+        ORDER BY
+            CASE
+                WHEN rs.daily_velocity = 0 THEN 9999
+                ELSE inv.quantity / rs.daily_velocity
+            END ASC
+    """)
+ 
+    try:
+        rows = db.session.execute(query, {
+            "company_id": company_id,
+            "cutoff":     recent_cutoff,
+            "days":       RECENT_SALES_DAYS,
+            "min_sales":  MIN_SALES_FOR_ALERT
+        }).fetchall()
+    except Exception as e:
+        logger.error(f"DB error fetching low-stock alerts for company {company_id}: {e}")
+        return jsonify({"error": "Failed to retrieve alerts. Please try again."}), 500
+ 
+    # --- 3. Shape the response ---
+    alerts = []
+    for row in rows:
+        if row.daily_velocity > 0:
+            days_until_stockout = int(row.current_stock / row.daily_velocity)
+        else:
+            days_until_stockout = None
+ 
+        alerts.append({
+            "product_id":          row.product_id,
+            "product_name":        row.product_name,
+            "sku":                 row.sku,
+            "warehouse_id":        row.warehouse_id,
+            "warehouse_name":      row.warehouse_name,
+            "current_stock":       row.current_stock,
+            "threshold":           row.threshold,
+            "days_until_stockout": days_until_stockout,
+            "supplier": {
+                "id":            row.supplier_id,
+                "name":          row.supplier_name,
+                "contact_email": row.supplier_email
+            } if row.supplier_id else None
+        })
+ 
+    return jsonify({"alerts": alerts, "total_alerts": len(alerts)}), 200
+```
+ 
+---
+ 
+### Edge Cases Handled
+ 
+| Edge Case | How It's Handled |
+|-----------|-----------------|
+| Company does not exist | 404 returned before any query runs |
+| Product below threshold but no recent sales | Excluded by `MIN_SALES_FOR_ALERT` filter |
+| Daily velocity is zero | Explicit check; `days_until_stockout` set to `null` |
+| No primary supplier configured | `LEFT JOIN` used; `supplier` is `null` in response |
+| Database failure | `try/except` with logged error; 500 returned, no stack trace leaked |
+| Bundle products | Filtered out with `product_type != 'bundle'` |
+| Inactive warehouses/products | `is_active = TRUE` filter on both tables |
+ 
+---
+ 
+### Performance Considerations
+ 
+- **Single SQL round-trip** using a CTE — no N+1 queries regardless of product/warehouse count.
+- Results **ordered by urgency in SQL** — no application-level sorting needed.
+- Consider a **partial index** on `inventory_logs(inventory_id, created_at) WHERE change_type = 'sale'` for large catalogs.
+- Strong candidate for **short-lived caching** (e.g. 5-minute Redis TTL) since stock levels don't change every second.
+- Add **pagination** (`limit` / `offset`) if companies can have hundreds of simultaneous alerts.
+ 
+---
+ 
+## Appendix — Assumptions Summary
+ 
+- SKU uniqueness is scoped per company, not globally.
+- "Recent sales activity" = at least 1 sale event within the last 30 days.
+- `low_stock_threshold` is a single integer per product; it does not vary by warehouse.
+- Bundle products are excluded from low-stock alerts.
+- Each product has at most one primary supplier for reorder purposes.
+- All monetary values are in a single currency; multi-currency is out of scope.
+- `inventory_logs` is append-only and records are never updated or deleted.
+- Soft-deletes via `is_active` flags rather than physical row deletion.
